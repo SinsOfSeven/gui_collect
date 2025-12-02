@@ -105,3 +105,34 @@ BLEND_1VGX_FMT = [
         'ByteWidth': 4
     }),
 ]
+
+SKDELTAS_FMT = [
+    BufferElement({
+        'Name': 'VERTEXID',
+        'SemanticName': 'VERTEXID',
+        'SemanticIndex': '0',
+        'Format': 'R32_UINT',
+        'ByteWidth': 4
+    }),
+    BufferElement({
+        'Name': 'POSITION',
+        'SemanticName': 'POSITION',
+        'SemanticIndex': '0',
+        'Format': 'R32G32B32_FLOAT',
+        'ByteWidth': 12
+    }),
+    BufferElement({
+        'Name': 'NORMAL',
+        'SemanticName': 'NORMAL',
+        'SemanticIndex': '0',
+        'Format': 'R32G32B32_FLOAT',
+        'ByteWidth': 12
+    }),
+    BufferElement({
+        'Name': 'TANGENT',
+        'SemanticName': 'TANGENT',
+        'SemanticIndex': '0',
+        'Format': 'R32G32B32_FLOAT',
+        'ByteWidth': 12
+    }),
+]
