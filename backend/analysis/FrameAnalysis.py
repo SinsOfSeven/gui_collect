@@ -4,14 +4,16 @@ import time
 import shutil
 import traceback
 import subprocess
+import struct
+import csv
 
 from pathlib import Path
 
 from backend.utils.buffer_utils.buffer_reader import get_buffer_elements
 from backend.utils.buffer_utils.buffer_encoder import merge_buffers, handle_no_weight_blend
-from backend.utils.buffer_utils.buffer_decoder import collect_binary_buffer_data
+from backend.utils.buffer_utils.buffer_decoder import collect_binary_buffer_data 
 from backend.utils.buffer_utils.exceptions import InvalidTextBufferException
-from backend.utils.buffer_utils.structs import BufferElement, POSITION_FMT, BLEND_4VGX_FMT, BLEND_2VGX_FMT, BLEND_1VGX_FMT
+from backend.utils.buffer_utils.structs import SKDELTAS_FMT, BufferElement, POSITION_FMT, BLEND_4VGX_FMT, BLEND_2VGX_FMT, BLEND_1VGX_FMT
 
 from backend.config.Config import Config
 
@@ -23,6 +25,10 @@ from frontend.state import State
 
 FILEBROWSER_PATH = os.path.join(os.getenv('WINDIR'), 'explorer.exe')
 
+class Offset:
+    def __init__(self, offset, count):
+        self.offset = offset
+        self.count = count
 
 class FrameAnalysis():
     def __init__(self, frame_analysis_path: Path):
@@ -88,9 +94,9 @@ class FrameAnalysis():
         
         buffer_path    = buffer_paths[0].with_suffix('.buf')
         buffer_formats = [element.Format for element in buffer_elements]
-        buffer, sk_data = collect_binary_buffer_data(buffer_path, buffer_formats, buffer_stride, self.terminal, **shapekey_args)
+        buffer = collect_binary_buffer_data(buffer_path, buffer_formats, buffer_stride, self.terminal, **shapekey_args)
 
-        return buffer, buffer_elements, sk_data
+        return buffer, buffer_elements
 
     def get_blend_data(self, buffer_paths: list[Path], expected_vertex_count: int):
         if len(buffer_paths) == 0: return None, None
@@ -123,6 +129,60 @@ class FrameAnalysis():
             buffer         = collect_binary_buffer_data(buffer_path, buffer_formats, buffer_stride, self.terminal)
 
             return buffer, buffer_elements
+
+    def get_sk_data(self,  buffer_paths: list[Path]):
+        if len(buffer_paths) == 0: return None, None
+
+        buffer_stride   = 40
+        buffer_elements = SKDELTAS_FMT
+
+        if txt_buffer_paths := [p for p in buffer_paths if p.suffix != '.buf']:
+            # Technically unreachable code due to lack of txt file for SKDeltas
+            try:
+                buffer_stride, buffer_elements = get_buffer_elements(txt_buffer_paths)
+            except InvalidTextBufferException:
+                self.terminal.print(f'<WARNING>WARNING: SKIPPING Invalid SKDELTA text buffer!</WARNING>')
+                for p in buffer_paths:
+                    self.terminal.print(f'<WARNING>{p.name}</WARNING>', timestamp=False)
+        
+        buffer_path    = buffer_paths[0].with_suffix('.buf')
+        buffer_formats = [element.Format for element in buffer_elements]
+        buffer = collect_binary_buffer_data(buffer_path, buffer_formats, buffer_stride, self.terminal)
+
+        return buffer, buffer_elements
+
+    def get_sk_offsets(self, shapekey_buffer_path: Path):
+        record_format = '<I9f'
+        record_size = struct.calcsize(record_format)
+        sk_deltas = []
+
+        with open(shapekey_buffer_path, 'rb') as f:
+            while chunk := f.read(record_size):
+                if len(chunk) == record_size:
+                    unpacked_data = struct.unpack(record_format, chunk)
+                    sk_deltas.append({
+                        "VINDEX": unpacked_data[0],
+                        "POSITION": unpacked_data[1:4],
+                        "NORMAL": unpacked_data[4:7],
+                        "TANGENT": unpacked_data[7:10]
+                    })
+
+        offsets: list[Offset] = []
+
+        offset: int = 0
+        for i in range(len(sk_deltas)):
+            vindex = sk_deltas[i]["VINDEX"]
+            if i + 1 >= len(sk_deltas):
+                break
+            next_vindex = sk_deltas[i + 1]["VINDEX"]
+            if vindex >= next_vindex:
+                offsets.append(Offset(offset, i - offset + 1))
+                offset = i + 1
+        offsets.append(Offset(offset, len(sk_deltas) - offset))
+
+        data_to_write = [o.__dict__ for o in offsets]
+
+        return data_to_write
     
 
     def export(self, export_name, components: list[Component], textures = None, *, game: str):
@@ -134,7 +194,6 @@ class FrameAnalysis():
         extract_path.mkdir(parents=True, exist_ok=True)
 
         st = time.time()
-
         for i, component in enumerate(components):
             self.terminal.print(f'Exporting [{component.ib_hash}] - {component.name}')
             self.terminal.print((
@@ -158,27 +217,29 @@ class FrameAnalysis():
                 position_paths = [component.position_path] if component.position_path else component.backup_position_paths
                 blend_paths    = [component.blend_path]    if component.blend_path    else []
                 texcoord_paths = [component.texcoord_path] if component.texcoord_path else component.backup_texcoord_paths
+                sk_deltas_paths = [component.shapekey_buffer_path] if component.shapekey_buffer_path else []
 
-                position_data, position_elements, sk_data = self.get_position_data(position_paths, {
+                position_data, position_elements = self.get_position_data(position_paths, {
                         'shapekey_buffer_path': component.shapekey_buffer_path,
                         'shapekey_cb_paths':    component.shapekey_cb_paths
                     } if component.shapekey_buffer_path and component.shapekey_cb_paths else {}
                 )
                 blend_data, blend_elements       = self.get_blend_data(blend_paths, len(position_data))
                 texcoord_data, texcoord_elements = self.get_texcoord_data(texcoord_paths)
+                sk_data, sk_deltas_elements = self.get_sk_data(sk_deltas_paths)
+                sk_offsets = self.get_sk_offsets(component.shapekey_buffer_path) if component.shapekey_buffer_path else []
 
-                if i == 0 and component.shapekey_buffer_path:
+                if component.shapekey_buffer_path:
                     sk_offsets_path_buf: Path = extract_path / (export_name + component.name + "SKDeltas.buf")
                     shutil.copy(component.shapekey_buffer_path, sk_offsets_path_buf)
                     # write sk_data csv
-                    if sk_data is not None:
-                        import csv
+                    if len(sk_offsets) != 0:
                         sk_offsets_path_csv: Path = extract_path / (export_name + component.name + "SKOffsets.csv")
 
                         with open(sk_offsets_path_csv, "w", encoding="UTF-8") as f:
-                            writer = csv.DictWriter(f, fieldnames=sk_data[0], lineterminator="\n")
+                            writer = csv.DictWriter(f, fieldnames=sk_offsets[0], lineterminator="\n")
                             writer.writeheader()
-                            writer.writerows(sk_data)
+                            writer.writerows(sk_offsets)
                 else:
                     self.terminal.print("NO SHAPEKEY PATH")
 
@@ -199,9 +260,15 @@ class FrameAnalysis():
 
                 self.terminal.print(f'Constructing combined buffer for [{component.ib_hash}] - {component.name}')
                 vb_merged = merge_buffers(buffers, elements) if buffers else None
+
+                if sk_data:
+                    sk_buffer = merge_buffers([sk_data], [sk_deltas_elements])
+                    _export_component_sk_buffer(export_name, extract_path, component, sk_buffer)
             
             if component.options['collect_texture_data'] and  textures: _export_component_textures(export_name, extract_path, component, textures[i])
             if component.options['collect_model_data']   and vb_merged:  _export_component_buffers(export_name, extract_path, component, vb_merged)
+
+            
 
         json_out = json.dumps(json_builder.build(), indent=4)
         (extract_path / 'hash.json').write_text(json_out)
@@ -240,6 +307,13 @@ def _export_component_buffers(export_name: str, path: Path, component: Component
 
         ib_file_path = (path/ib_file_name)
         shutil.copyfile(ib_path, ib_file_path)
+
+
+def _export_component_sk_buffer(export_name: str, path: Path, component: Component, sk_data):
+    prefix = export_name + component.name 
+    t0_file_name = '{}SKDeltas.txt'.format(prefix)
+    sk_file_path = (path/t0_file_name)
+    sk_file_path.write_text(sk_data)
 
 
 def _export_component_textures(export_name: str, path: Path, component: Component, textures):
